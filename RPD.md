@@ -2,30 +2,34 @@
 
 ## Overview
 
-Automate the extraction of addresses from candidate nomination petition PDFs and determine which political jurisdiction each address falls within by querying a geospatial/civic API.
+Automate the extraction of addresses from candidate nomination petition PDFs and determine which municipal jurisdiction each signer's address falls within, using only free APIs. Designed to process tens of thousands of signatures per run.
 
 ---
 
 ## Problem Statement
 
-Election staff must manually cross-reference each signer's address from nomination petitions against district maps to verify that signers are registered voters in the correct political jurisdiction. This is time-consuming, error-prone, and does not scale for petitions with hundreds or thousands of signatures.
+Election staff must manually cross-reference each signer's address from nomination petitions against municipal boundaries to verify that signers reside within the correct jurisdiction. This is time-consuming, error-prone, and does not scale for petitions with tens of thousands of signatures.
 
 ---
 
 ## Goals
 
-- Extract all signer addresses from nomination petition PDFs without manual data entry.
-- Resolve each address to its political jurisdiction(s) (e.g., state legislative district, congressional district, city ward, county precinct).
-- Flag addresses that are outside the target jurisdiction or that cannot be resolved.
+- Extract all signer addresses from scanned nomination petition PDFs via OCR.
+- Resolve each address to its municipality (city/town/township/village) using free APIs.
+- Flag addresses that are outside the target municipality or that cannot be resolved.
 - Produce a structured output report (CSV/JSON) that staff can review and act on.
+- Handle tens of thousands of addresses per run efficiently.
 
 ---
 
 ## Non-Goals
 
 - Voter registration status verification (out of scope; separate system).
-- Signature authenticity or handwriting recognition for fully handwritten petitions.
+- Signature authenticity or handwriting recognition beyond printed/typed form fields.
 - Real-time/live petition review (batch processing is sufficient for v1).
+- Congressional or state legislative district lookups (future phase).
+- Support for non-US jurisdictions.
+- Paid API integrations.
 
 ---
 
@@ -33,121 +37,171 @@ Election staff must manually cross-reference each signer's address from nominati
 
 | # | As a... | I want to... | So that... |
 |---|---------|-------------|------------|
-| 1 | Election clerk | Upload one or more petition PDFs | All addresses are extracted automatically |
-| 2 | Election clerk | See each address mapped to a jurisdiction | I can verify signers are in the correct district |
-| 3 | Election clerk | Download a report of results | I can share findings with staff or candidates |
+| 1 | Election clerk | Run the tool against one or more petition PDFs | All addresses are extracted automatically |
+| 2 | Election clerk | See each address mapped to a municipality | I can verify signers are in the correct jurisdiction |
+| 3 | Election clerk | Download a CSV report of results | I can share findings with staff or candidates |
 | 4 | Election supervisor | See a summary count of valid vs. invalid addresses | I can quickly assess petition validity |
-| 5 | Developer | Re-run lookups on a subset of addresses | I can handle API failures or rate limits gracefully |
+| 5 | Developer | Re-run lookups on failed addresses without re-processing the whole PDF | I can recover from transient errors without wasting time |
 
 ---
 
 ## Functional Requirements
 
 ### 1. PDF Ingestion
-- Accept PDF files via a CLI, web upload, or watched directory.
-- Support both digitally-generated PDFs (selectable text) and scanned PDFs (OCR fallback).
-- Parse known petition form layouts (structured tables) and semi-structured/freeform layouts.
 
-### 2. Address Extraction
-- Extract the following fields per signer row where present:
-  - Street address (number + street name)
+- Accept one or more PDF file paths via CLI.
+- All PDFs are scanned images — OCR is the primary (and only) text extraction path.
+- Petitions follow a **consistent template**: same column layout and field positions across all files.
+- Extract all pages; skip page headers and footers based on known template positions.
+
+### 2. Address Extraction via OCR
+
+- Convert each PDF page to a high-resolution image (≥300 DPI).
+- Run Tesseract OCR on each page image.
+- Parse OCR output according to the known template structure (fixed column positions or table rows).
+- Extract per-signer row:
+  - Street address (number + street name + unit if present)
   - City
   - State
   - ZIP code
-- Normalize addresses (standardize abbreviations, remove extra whitespace).
-- Flag rows where address extraction is uncertain or incomplete.
+- Post-process OCR output:
+  - Fix common OCR errors (e.g., `0` vs `O`, `l` vs `1`).
+  - Normalize whitespace and capitalization.
+  - Strip non-address noise from fields.
+- Flag rows where a required field is missing or confidence is low.
 
 ### 3. Jurisdiction Lookup
-- Send each extracted address to a civic/geospatial API to resolve political jurisdictions.
-- Capture at minimum:
-  - Congressional district
-  - State upper legislative chamber district (e.g., State Senate)
-  - State lower legislative chamber district (e.g., State House/Assembly)
-  - County
-  - Municipality / city
-  - Additional jurisdictions as needed (school board, water district, etc.)
-- Handle API errors, rate limits, and unresolvable addresses with retries and graceful degradation.
 
-**Candidate APIs:**
-| API | Notes |
-|-----|-------|
-| Google Civic Information API | Returns elected officials and districts for a given address; well-documented |
-| US Census Geocoder + TIGERweb | Free, no key required; returns FIPS codes for state/county/tract |
-| Geocodio | Paid; returns congressional and state legislative districts in one call |
-| SmartyStreets (now Smarty) | Paid; USPS-certified; returns county + congressional district |
-| OpenStates Geo API | Open source; state legislative districts from shapefiles |
+- Resolve each extracted address to its municipality using the **US Census Geocoder batch API**.
+- The Census Geocoder is free, requires no API key, and returns the Census-designated place (municipality) via FIPS code and name.
+- Batch addresses in groups of **1,000** (Census API limit per batch request).
+- For each address return:
+  - Matched/normalized address string from Census
+  - State FIPS code
+  - County FIPS code + name
+  - Place FIPS code + name (municipality)
+  - Match type (`Exact`, `Non_Exact`, `Tie`)
+  - Match status (`Match`, `No_Match`, `Tie`)
+- Retry failed batches up to 3 times with exponential backoff (2s, 4s, 8s).
+- Addresses with `No_Match` are marked `unresolved` and included in the report for manual review.
 
-Recommended default: **Google Civic Information API** for richness of response + **US Census Geocoder** as a free fallback.
+**API:** `https://geocoding.geo.census.gov/geocoder/geographies/addressbatch`
+- Method: POST, multipart form
+- Benchmark input: vintage `Current_Current`, layers `Census2020`
+- No authentication required
+- Rate limit: none published; batch of 1,000 keeps request count manageable
 
 ### 4. Output Report
-- Produce a structured report with one row per signer containing:
-  - Original extracted address
-  - Normalized/verified address
-  - Each jurisdiction field
-  - Match confidence / status (`resolved`, `partial`, `unresolved`, `outside_jurisdiction`)
-  - Source API used
-- Export formats: CSV (primary), JSON (secondary).
-- Summary section: total signers, resolved count, unresolved count, outside-jurisdiction count.
+
+Produce a CSV with one row per signer:
+
+| Column | Description |
+|--------|-------------|
+| `row_num` | Row number within the petition (1-based, across all pages) |
+| `pdf_file` | Source PDF filename |
+| `page_num` | Page number within the PDF |
+| `raw_address` | Address string as extracted from OCR |
+| `normalized_address` | Matched address returned by Census Geocoder |
+| `state_fips` | 2-digit state FIPS code |
+| `county_fips` | 5-digit county FIPS code |
+| `county_name` | County name |
+| `place_fips` | 7-digit place FIPS code |
+| `place_name` | Municipality name (Census-designated place) |
+| `match_type` | `Exact`, `Non_Exact`, `Tie`, or blank |
+| `status` | `resolved`, `partial`, `unresolved` |
+| `in_jurisdiction` | `true` / `false` / `unknown` |
+
+- Export CSV to a configurable output directory.
+- Print a summary to console on completion:
+  - Total rows processed
+  - Resolved count
+  - Unresolved count
+  - In-jurisdiction count
+  - Out-of-jurisdiction count
 
 ### 5. Jurisdiction Filtering
-- Accept a target jurisdiction as input (e.g., "NY-14" congressional district or a specific state senate district ID).
-- Mark each resolved address as `in_jurisdiction` or `out_of_jurisdiction`.
+
+- Accept a target municipality name or place FIPS code as a CLI argument.
+- Mark each resolved address `in_jurisdiction=true` if the resolved place matches the target, `false` otherwise.
+- Matching is case-insensitive; also match common name variants (e.g., "City of X" vs "X").
 
 ---
 
 ## Technical Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        CLI / Web UI                         │
-│          (upload PDFs, specify target jurisdiction)         │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                    ┌──────▼──────┐
-                    │  PDF Parser │  (pdfplumber / PyMuPDF + Tesseract OCR)
-                    └──────┬──────┘
-                           │  raw address strings
-                    ┌──────▼──────┐
-                    │  Address    │  (usaddress / libpostal / regex)
-                    │  Normalizer │
-                    └──────┬──────┘
-                           │  structured address objects
-                    ┌──────▼──────┐
-                    │  Jurisdiction│  (Google Civic API primary,
-                    │  Lookup      │   Census Geocoder fallback)
-                    └──────┬──────┘
-                           │  jurisdiction objects
-                    ┌──────▼──────┐
-                    │  Report     │  (CSV / JSON output)
-                    │  Generator  │
-                    └─────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                            CLI                                   │
+│   (PDF paths, target municipality, output dir)                   │
+└────────────────────────┬─────────────────────────────────────────┘
+                         │
+                  ┌──────▼──────┐
+                  │  PDF → Image│  pdf2image (poppler)
+                  │  Converter  │  300 DPI, per-page PNG
+                  └──────┬──────┘
+                         │  page images
+                  ┌──────▼──────┐
+                  │  OCR Engine │  pytesseract (Tesseract 5)
+                  └──────┬──────┘
+                         │  raw text / hOCR
+                  ┌──────▼──────┐
+                  │  Template   │  fixed-column parser for
+                  │  Parser     │  known petition layout
+                  └──────┬──────┘
+                         │  structured address rows
+                  ┌──────▼──────┐
+                  │  Address    │  usaddress + regex cleanup
+                  │  Normalizer │
+                  └──────┬──────┘
+                         │  clean address objects (batches of 1,000)
+                  ┌──────▼──────┐
+                  │  Census     │  POST addressbatch endpoint
+                  │  Geocoder   │  free, no key, returns place FIPS
+                  └──────┬──────┘
+                         │  geocoded results
+                  ┌──────▼──────┐
+                  │  Jurisdiction│  compare place FIPS / name
+                  │  Evaluator  │  against target municipality
+                  └──────┬──────┘
+                         │
+                  ┌──────▼──────┐
+                  │  Report     │  CSV + console summary
+                  │  Generator  │
+                  └─────────────┘
 ```
 
-### Technology Stack (recommended)
+### Technology Stack
 
 | Layer | Choice | Rationale |
 |-------|--------|-----------|
-| Language | Python 3.11+ | Strong PDF/NLP/geo library ecosystem |
-| PDF parsing | `pdfplumber` (digital), `pytesseract` + `Pillow` (scanned) | Handles both PDF types |
-| Address parsing | `usaddress` or `libpostal` | US-specific parsing; handles abbreviations |
-| HTTP client | `httpx` (async) | Async batch API calls with retries |
-| Jurisdiction API | Google Civic Information API | Rich district data |
-| Fallback API | US Census Geocoder | Free, no key, FIPS codes |
-| CLI | `click` or `typer` | Simple UX for staff |
-| Output | `csv` / `json` stdlib | No extra dependencies |
-| Testing | `pytest` + `responses` (mock HTTP) | Unit and integration tests |
+| Language | Python 3.11+ | Strong PDF/OCR/geo library ecosystem |
+| PDF → image | `pdf2image` + `poppler-utils` | Reliable raster conversion at configurable DPI |
+| OCR | `pytesseract` (Tesseract 5) | Industry-standard free OCR; good on printed forms |
+| Address parsing | `usaddress` | US-specific; handles abbreviations and component splitting |
+| HTTP client | `httpx` | Sync batch POST with retry; simple for staff environments |
+| Jurisdiction API | US Census Geocoder batch API | Free, no key, returns place FIPS, handles 1k/batch |
+| CLI | `click` | Lightweight, well-known UX for staff scripts |
+| Output | `csv` stdlib | No extra dependencies |
+| Testing | `pytest` + `responses` | Unit and integration tests with mocked HTTP |
 
 ---
 
-## Data Flow
+## Performance Considerations
 
-1. **Input**: One or more petition PDFs + target jurisdiction ID.
-2. **Parse**: Extract text from PDF; identify signer rows by table structure or regex patterns.
-3. **Extract**: Pull address fields from each row; flag ambiguous extractions.
-4. **Normalize**: Standardize address format; remove noise.
-5. **Lookup**: Batch-query the jurisdiction API; apply retry logic (3 attempts, exponential backoff).
-6. **Evaluate**: Compare resolved jurisdiction against target jurisdiction; assign status.
-7. **Output**: Write CSV/JSON report + print summary to console.
+At tens of thousands of signers per run:
+
+- **OCR is the bottleneck.** Use multiprocessing (`concurrent.futures.ProcessPoolExecutor`) to OCR multiple pages in parallel, limited to `os.cpu_count()` workers.
+- **Census Geocoder batching.** 1,000-address batches mean ~10–50 HTTP requests for 10k–50k addresses. Run batches concurrently (up to 5 parallel requests) to stay within reasonable server load.
+- **Deduplication.** De-duplicate addresses before geocoding; map results back to all matching rows. Large petitions often have repeated addresses.
+- **Intermediate checkpointing.** After geocoding each batch, append results to the output CSV immediately so a crash does not lose all work. On restart, skip rows already present in the output file.
+
+Estimated throughput targets:
+
+| Stage | Rate | Time for 50k rows |
+|-------|------|-------------------|
+| OCR (8-core machine) | ~2 pages/sec | ~1–3 hrs (varies by page density) |
+| Census Geocoder (5 parallel batches) | ~5k addresses/min | ~10 min |
+| Total | — | ~1–3 hrs (OCR-bound) |
 
 ---
 
@@ -155,56 +209,56 @@ Recommended default: **Google Civic Information API** for richness of response +
 
 | Scenario | Handling |
 |----------|----------|
-| Scanned/handwritten PDF | OCR fallback; flag low-confidence extractions |
-| Incomplete address (no ZIP) | Attempt lookup with city+state; mark as `partial` |
-| API rate limit (429) | Exponential backoff; queue retry |
-| Address not found by API | Mark `unresolved`; include in report for manual review |
-| Duplicate addresses | Deduplicate before API calls; attribute results back to all matching rows |
-| PO Box / non-residential | Flag; many districts cannot be determined from PO Boxes |
-| Multi-page petition forms | Parse all pages; ignore header/footer rows |
+| Low OCR confidence on a field | Flag row as `partial`; include raw OCR text in report |
+| Missing ZIP code | Attempt geocode with street + city + state only; mark as `partial` |
+| Census API returns `No_Match` | Mark `unresolved`; include in report for manual review |
+| Census API HTTP error / timeout | Retry batch up to 3× with exponential backoff; if all retries fail, mark rows `unresolved` with error note |
+| Duplicate addresses | Deduplicate before API calls; attribute result to all matching rows |
+| PO Box address | Flag; Census Geocoder cannot resolve PO Boxes to a place |
+| Multi-page petitions | Process all pages; detect and skip header/footer rows by template row-count rules |
+| Partially visible row at page edge | Flag as `partial` if any required field is truncated |
+| Run interrupted mid-way | Resume from checkpoint — skip rows already written to output CSV |
 
 ---
 
-## API Key & Configuration
+## Configuration
 
-Configuration via environment variables or a `.env` file:
+All configuration via CLI flags with optional `.env` file fallback:
 
 ```
-GOOGLE_CIVIC_API_KEY=<your_key>
-TARGET_JURISDICTION=<district_id>   # e.g., ocd-division/country:us/state:ny/cd:14
-BATCH_SIZE=50                        # addresses per API batch (if supported)
-OUTPUT_FORMAT=csv                    # csv | json
+TARGET_MUNICIPALITY=<name or place FIPS>  # e.g., "Springfield" or "1770000"
 OUTPUT_DIR=./output
+OUTPUT_FORMAT=csv
+DPI=300                  # OCR scan resolution (300 recommended minimum)
+BATCH_SIZE=1000          # Census Geocoder batch size (max 1000)
+MAX_PARALLEL_BATCHES=5   # Concurrent geocoder requests
+OCR_WORKERS=8            # Parallel OCR processes (default: cpu count)
+RESUME=true              # Skip rows already in output file
 ```
 
 ---
 
 ## Acceptance Criteria
 
-- [ ] Given a digitally-generated petition PDF, all addresses are extracted with ≥95% accuracy on clean forms.
-- [ ] Each extracted address returns at least congressional district and state legislative district when the address is valid and within the US.
-- [ ] Addresses that cannot be resolved are flagged as `unresolved` rather than silently dropped.
-- [ ] Output CSV includes all required columns (address, normalized address, all jurisdiction fields, status).
-- [ ] Summary stats are printed to console on completion.
-- [ ] Unit tests cover address normalization, jurisdiction lookup (mocked), and report generation.
-- [ ] Tool runs end-to-end on a sample 50-row petition in under 60 seconds.
+- [ ] All input PDFs are scanned images; the tool does not require selectable text.
+- [ ] Addresses are extracted using the known petition template layout with ≥90% field extraction accuracy on clean scans.
+- [ ] Each extracted address is submitted to the Census Geocoder in batches of ≤1,000.
+- [ ] Resolved addresses include `place_name` and `place_fips` (municipality).
+- [ ] Each address is marked `in_jurisdiction`, `out_of_jurisdiction`, or `unknown` based on the target municipality input.
+- [ ] Unresolved addresses are flagged and included in the output — never silently dropped.
+- [ ] Output CSV includes all required columns.
+- [ ] Console summary is printed on completion.
+- [ ] A run interrupted mid-way can be resumed without re-geocoding already-processed rows.
+- [ ] Unit tests cover: OCR template parsing, address normalization, Census API response parsing (mocked), jurisdiction evaluation, and report writing.
+- [ ] Tool processes 50,000 addresses end-to-end without out-of-memory errors on a standard 8GB RAM machine.
 
 ---
 
 ## Out of Scope (Future Phases)
 
+- Congressional or state legislative district lookups.
 - Web UI with drag-and-drop upload.
 - Database storage of historical lookups.
 - Integration with voter registration database for full signature validation.
-- Support for non-US jurisdictions.
-- Handwriting recognition for fully handwritten petitions.
-
----
-
-## Open Questions
-
-1. Which specific jurisdictions/districts are most commonly needed (congressional only, or also state legislative, municipal)?
-2. Do petitions follow a consistent template, or do formats vary by candidate/office?
-3. Is there a budget for paid APIs (Geocodio, Smarty), or should the solution be free/open-source only?
-4. What volume of petitions/signers should the tool handle (100s vs. 10,000s per run)?
-5. Should unresolved addresses be automatically sent to a secondary lookup (e.g., manual geocoder queue)?
+- Paid API integrations (Geocodio, Smarty, Google Civic).
+- Handwriting recognition (current scope covers printed/typed form fields only).
