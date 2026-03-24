@@ -3,3 +3,5 @@
 *.jpg
 *.jpeg
 /output/
+__pycache__/
+*.pyc
